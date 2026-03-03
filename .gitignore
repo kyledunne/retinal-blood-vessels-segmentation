@@ -1,0 +1,5 @@
+.idea
+data/train_images
+data/train_labels
+data/test_images
+data/test_labels
