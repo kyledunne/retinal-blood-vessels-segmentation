@@ -58,7 +58,6 @@ class Config:
         self.starting_learning_rate = 1e-4
         self.max_epochs = 200
         self.patience = 50
-        self.layers_to_unfreeze = 10
         self.num_workers = 9 if env.device == 'cuda' else 0
         self.pin_memory = self.num_workers > 0
         self.use_amp = env.device == 'cuda'
@@ -193,7 +192,107 @@ class RetinaSegModel(nn.Module):
         return self.model(x)
 
 
+class RetinaSegLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loss = nn.BCEWithLogitsLoss()
 
+    def forward(self, logits, targets):
+        return self.loss(logits, targets)
+
+
+def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler, scheduler):
+    model.train()
+    running_loss = 0.0
+
+    num_batches = _num_batches(loader)
+    for batch_number, (x, y) in enumerate(loader):
+        print(f't={time.time() - start_time:.2f}: Loading training batch {batch_number + 1}/{num_batches}')
+
+        x = x.to(env.device, non_blocking=True)
+        y = y.to(env.device, non_blocking=True)
+
+        if config.verbose or batch_number == 0:
+            allocated = torch.cuda.memory_allocated(env.device) / 1024**3
+            reserved = torch.cuda.memory_reserved(env.device) / 1024**3
+            print(f'Memory allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB')
+            print(f'First image with overlayed ground-truth mask:')
+            visualize_mask_overlayed_over_image(x[0], y[0])
+
+        optimizer.zero_grad()
+        with torch.amp.autocast('cuda', enabled=config.use_amp):
+            logits = model(x)
+            if config.verbose or batch_number == 0:
+                logits_0_mask = logits[0].argmax(dim=0)
+                print(f'First image with overlayed prediction mask:')
+                visualize_mask_overlayed_over_image(x[0], logits_0_mask)
+            loss = loss_function(logits, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / num_batches
+    return epoch_loss
+
+
+@torch.no_grad()
+def validate_one_epoch(start_time, model, loader, loss_function):
+    model.eval()
+    running_loss = 0.0
+
+    num_batches = _num_batches(loader)
+    for batch_number, (x, y) in enumerate(loader):
+        print(f'v={time.time() - start_time:.2f}: Loading validation batch {batch_number + 1}/{num_batches}')
+
+        x = x.to(env.device, non_blocking=True)
+        y = y.to(env.device, non_blocking=True)
+
+        if config.verbose or batch_number == 0:
+            print(f'First image with overlayed ground-truth mask:')
+            visualize_mask_overlayed_over_image(x[0], y[0])
+
+        with torch.amp.autocast('cuda', enabled=config.use_amp):
+            logits = model(x)
+            if config.verbose or batch_number == 0:
+                logits_0_mask = logits[0].argmax(dim=0)
+                print(f'First image with overlayed prediction mask:')
+                visualize_mask_overlayed_over_image(x[0], logits_0_mask)
+            loss = loss_function(logits, y)
+
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / num_batches
+    return epoch_loss
+
+
+def train(
+        start_epoch = 1,
+        saved_model_weights = None,
+):
+    start_time = time.time()
+    print('t=0: Starting data prep and model loading')
+
+    run = wandb.init(
+        project='retina-segmentation',
+        name=f'run={int(start_time)}',
+        config={
+            'batch_size': config.batch_size,
+            'starting_learning_rate': config.starting_learning_rate,
+            'max_epochs': config.max_epochs,
+            'patience': config.patience,
+            'seed': config.seed,
+            'model': 'UNet++',
+            'encoder': config.encoder_name,
+        },
+    )
+
+    train_ids = env.fetch_train_ids()
+    val_ids = env.fetch_val_ids()
+
+    model =
 
 
 def main():
