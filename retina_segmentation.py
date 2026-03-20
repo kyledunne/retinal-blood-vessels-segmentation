@@ -406,8 +406,8 @@ def train(
         epochs = list(range(1, len(train_ious) + 1))
 
         plt.figure(figsize=(8, 5))
-        plt.plot(epochs, train_ious, label='train_iou', marker='o')
-        plt.plot(epochs, val_ious, label='val_iou', marker='o')
+        plt.plot(epochs, train_ious, label='Train mean IoU', marker='o')
+        plt.plot(epochs, val_ious, label='Val mean IoU', marker='o')
         plt.xlabel('Epoch')
         plt.ylabel('IoU')
         plt.title('Training and Validation mean IoU per Epoch')
@@ -433,9 +433,7 @@ def main():
     global env, config
     env = local_env
     config = Config(training=True)
-    model = RetinaSegModel()
-    print_model_torchinfo(model.model)
-    print_model(model)
+    train()
 
 if __name__ == '__main__':
     main()
