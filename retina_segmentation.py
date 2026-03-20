@@ -292,7 +292,37 @@ def train(
     train_ids = env.fetch_train_ids()
     val_ids = env.fetch_val_ids()
 
-    model =
+    model = RetinaSegModel(saved_model_weights=saved_model_weights)
+
+    wandb.watch(model, log='gradients', log_freq=100)
+
+    train_dataset = SegmentationDataset(
+        images_root_folder=env.train_images_folder,
+        masks_root_folder=env.train_labels_folder,
+        image_suffix='.tif',
+        mask_suffix='.tif',
+        image_transforms=config.train_transforms,
+        image_ids=train_ids,
+        has_masks=True,
+    )
+    val_dataset = SegmentationDataset(
+        images_root_folder=env.val_images_folder,
+        masks_root_folder=env.val_labels_folder,
+        image_suffix='.tif',
+        mask_suffix='.tif',
+        image_transforms=config.val_transforms,
+        image_ids=val_ids,
+        has_masks=True,
+    )
+
+    train_loader = create_dataloader(train_dataset, shuffle=True)
+    val_loader = create_dataloader(val_dataset, shuffle=False)
+
+    loss_function = RetinaSegLoss()
+    optimizer = TorchOptimizers.AdamW(model.parameters(), lr=config.starting_learning_rate)
+    scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp)
+
+    TODO()
 
 
 def main():
