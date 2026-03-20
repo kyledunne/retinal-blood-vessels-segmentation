@@ -231,7 +231,8 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         running_loss += loss.item()
 
     epoch_loss = running_loss / num_batches
@@ -321,8 +322,111 @@ def train(
     loss_function = RetinaSegLoss()
     optimizer = TorchOptimizers.AdamW(model.parameters(), lr=config.starting_learning_rate)
     scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp)
+    scheduler = None
 
-    TODO()
+    best_val_iou = float('-inf')
+    best_val_iou_epoch = -1
+
+    history = dict(
+        train_loss=[], val_loss=[], train_iou=[], val_iou=[],
+        best_val_iou=dict(),
+    )
+
+    training_start_time = time.time()
+    print(f't={training_start_time - start_time:.2f}: Started training')
+    print(f'Config: {config}')
+
+    torch.manual_seed(config.seed)
+
+    best_weights_path = config.training_output_folder + 'best.pt'
+
+    epochs_since_best = 0
+
+    try:
+        for epoch in range(start_epoch, config.max_epochs + 1):
+            epoch_start_time = time.time()
+            print(f't={epoch_start_time - start_time:.2f}: Starting epoch {epoch}/{config.max_epochs}. Early stopping in {config.patience - epochs_since_best} epochs.')
+
+            train_loss, train_iou = train_one_epoch(epoch_start_time, model, train_loader, optimizer, loss_function, scaler, scheduler)
+
+            if env.device == 'cuda':
+                torch.cuda.empty_cache()
+
+            val_loss, val_iou = validate_one_epoch(epoch_start_time, model, val_loader, loss_function)
+
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['train_iou'].append(train_iou)
+            history['val_iou'].append(val_iou)
+
+            print(f'================ Epoch {epoch:03d} stats ==================')
+            print(f'train_loss: {train_loss:.4f}  val_loss: {val_loss:.4f}')
+            print(f'train_iou: {train_iou:.4f}  val_iou: {val_iou:.4f}')
+            print('===================================================')
+
+            wandb.log({
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_iou': train_iou,
+                'val_iou': val_iou,
+            })
+
+            if val_iou > best_val_iou:
+                best_val_iou = val_iou
+                best_val_iou_epoch = epoch
+                epochs_since_best = 0
+                torch.save(model.state_dict(), best_weights_path)
+            else:
+                epochs_since_best += 1
+                if epochs_since_best >= config.patience:
+                    wandb.run.summary['early_stopping_triggered'] = True
+                    break
+
+    except KeyboardInterrupt:
+        print(f't={time.time() - start_time:.2f}: Training manually interrupted')
+        wandb.run.summary['training_manually_interrupted'] = True
+
+    finally:
+        history['best_val_iou']['val_iou'] = best_val_iou
+        history['best_val_iou']['epoch'] = best_val_iou_epoch
+
+        print()
+        print('==================== Results ======================')
+        print(f'Best val iou: {best_val_iou:.2f}')
+        print(f'Best val iou epoch: {best_val_iou_epoch}')
+        print('===================================================')
+        print()
+
+        wandb.run.summary['best_val_iou'] = best_val_iou
+        wandb.run.summary['best_val_iou_epoch'] = best_val_iou_epoch
+
+        train_ious = history['train_iou']
+        val_ious = history['val_iou']
+
+        epochs = list(range(1, len(train_ious) + 1))
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, train_ious, label='train_iou', marker='o')
+        plt.plot(epochs, val_ious, label='val_iou', marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('IoU')
+        plt.title('Training and Validation mean IoU per Epoch')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+
+        wandb.log({'iou_plot': wandb.Image(plt.gcf())})
+
+        plt.show()
+        plt.close()
+
+        with open(env.training_output_folder + 'history.json', 'w') as json_file:
+            json.dump(history, json_file, indent=4)
+
+        wandb.save(best_weights_path)
+        wandb.save(env.training_output_folder + 'history.json')
+
+        wandb.finish()
 
 
 def main():
