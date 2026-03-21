@@ -421,8 +421,8 @@ def train(
     train_dataset = SegmentationDataset(
         images_root_folder=env.train_images_folder,
         masks_root_folder=env.train_labels_folder,
-        image_suffix='.tif',
-        mask_suffix='.tif',
+        image_suffix='tif',
+        mask_suffix='tif',
         image_transforms=config.train_transforms,
         image_ids=train_ids,
         has_masks=True,
@@ -430,8 +430,8 @@ def train(
     val_dataset = SegmentationDataset(
         images_root_folder=env.val_images_folder,
         masks_root_folder=env.val_labels_folder,
-        image_suffix='.tif',
-        mask_suffix='.tif',
+        image_suffix='tif',
+        mask_suffix='tif',
         image_transforms=config.val_transforms,
         image_ids=val_ids,
         has_masks=True,
