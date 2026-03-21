@@ -289,6 +289,8 @@ class RetinaSegModel(nn.Module):
             saved_model_weights = torch.load(saved_model_weights, weights_only=True, map_location='cpu')
             self.model.load_state_dict(saved_model_weights)
 
+        self.model.to(env.device)
+
     def forward(self, x):
         return self.model(x)
 
