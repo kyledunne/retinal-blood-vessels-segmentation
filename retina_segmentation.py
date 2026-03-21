@@ -302,6 +302,7 @@ class RetinaSegLoss(nn.Module):
 
     def forward(self, logits, targets):
         targets = targets.unsqueeze(1).float()
+        targets = (targets > 0.5).float()
         loss = self.loss(logits, targets)
 
         with torch.no_grad():
