@@ -299,7 +299,17 @@ class RetinaSegLoss(nn.Module):
         self.loss = nn.BCEWithLogitsLoss()
 
     def forward(self, logits, targets):
-        return self.loss(logits, targets)
+        loss = self.loss(logits, targets)
+
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+            targets_bin = (targets > 0.5).float()
+            intersection = (preds * targets_bin).sum()
+            union = preds.sum() + targets_bin.sum() - intersection
+            iou = intersection / (union + 1e-6)
+
+        return loss, iou
 
 
 def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler, scheduler):
