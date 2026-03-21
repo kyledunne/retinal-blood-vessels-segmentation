@@ -340,7 +340,7 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
         with torch.amp.autocast('cuda', enabled=config.use_amp):
             logits = model(x)
             if config.verbose or batch_number == 0:
-                logits_0_mask = logits[0].argmax(dim=0)
+                logits_0_mask = (logits[0, 0] > 0).long()
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
             loss, iou = loss_function(logits, y)
@@ -380,7 +380,7 @@ def validate_one_epoch(start_time, model, loader, loss_function):
         with torch.amp.autocast('cuda', enabled=config.use_amp):
             logits = model(x)
             if config.verbose or batch_number == 0:
-                logits_0_mask = logits[0].argmax(dim=0)
+                logits_0_mask = (logits[0, 0] > 0).long()
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
             loss, iou = loss_function(logits, y)
