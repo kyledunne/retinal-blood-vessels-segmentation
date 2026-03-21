@@ -21,6 +21,7 @@ import json
 import math
 from typing import Callable
 from pathlib import Path
+import random
 
 @dataclass
 class Environment:
@@ -33,7 +34,11 @@ class Environment:
     device: str
 
     def fetch_train_ids(self):
-        return np.array([f.stem for f in Path(self.train_images_folder).iterdir()])
+        ids = np.array([f.stem for f in Path(self.train_images_folder).iterdir()])
+        if config.fraction >= .99:
+            return ids
+        fraction_of_ids = random.choices(ids, k=math.ceil(len(ids) * config.fraction))
+        return fraction_of_ids
 
     def fetch_val_ids(self):
         return np.array([f.stem for f in Path(self.val_images_folder).iterdir()])
@@ -63,8 +68,8 @@ class Config:
         self.seed = 8675309
         self.batch_size = 32
         self.starting_learning_rate = 1e-4
-        self.max_epochs = 200
-        self.patience = 50
+        self.max_epochs = 40
+        self.patience = 5
         self.num_workers = 9 if env.device == 'cuda' else 0
         self.pin_memory = self.num_workers > 0
         self.use_amp = env.device == 'cuda'
@@ -72,6 +77,7 @@ class Config:
         self.original_image_height = 576
         self.image_width = 768
         self.image_height = 576
+        self.fraction = 0.1
 
         self.imagenet_mean_cpu_tensor = torch.tensor(imagenet_mean_array)
         self.imagenet_std_cpu_tensor = torch.tensor(imagenet_std_array)
