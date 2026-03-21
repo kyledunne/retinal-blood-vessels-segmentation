@@ -308,9 +308,8 @@ class RetinaSegLoss(nn.Module):
         with torch.no_grad():
             probs = torch.sigmoid(logits)
             preds = (probs > 0.5).float()
-            targets_bin = (targets > 0.5).float()
-            intersection = (preds * targets_bin).sum()
-            union = preds.sum() + targets_bin.sum() - intersection
+            intersection = (preds * targets).sum()
+            union = preds.sum() + targets.sum() - intersection
             iou = intersection / (union + 1e-6)
 
         return loss, iou
