@@ -20,6 +20,7 @@ import albumentations as A
 import json
 import math
 from typing import Callable
+from pathlib import Path
 
 @dataclass
 class Environment:
@@ -30,6 +31,12 @@ class Environment:
     saved_weights_filepath: str
     training_output_folder: str
     device: str
+
+    def fetch_train_ids(self):
+        return np.array([f.stem for f in Path(self.train_images_folder).iterdir()])
+
+    def fetch_val_ids(self):
+        return np.array([f.stem for f in Path(self.val_images_folder).iterdir()])
 
 
 env: Environment = None
@@ -80,6 +87,94 @@ class Config:
 
         torch.manual_seed(self.seed)
         self.generator = torch.Generator(device='cpu').manual_seed(self.seed)
+
+        self.train_transforms = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.03,
+                scale_limit=0.05,
+                rotate_limit=10,
+                interpolation=cv2.INTER_LINEAR,
+                border_mode=cv2.BORDER_CONSTANT,
+                p=0.5,
+            ),
+            A.OneOf([
+                A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=1.0),
+                A.RandomBrightnessContrast(0.15, 0.15, p=1.0),
+                A.RandomGamma(gamma_limit=(85, 115), p=1.0),
+            ], p=0.5),
+            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+            A.ToTensorV2(),
+        ])
+
+        self.train_transforms_2 = A.Compose([
+            A.HorizontalFlip(p=0.5),
+
+            A.Affine(
+                scale=(0.95, 1.05),
+                translate_percent=(-0.03, 0.03),
+                rotate=(-10, 10),
+                shear=(-5, 5),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                p=0.7,
+            ),
+
+            # Mild crop/resize jitter around full resolution
+            A.OneOf([
+                A.RandomResizedCrop(
+                    size=(576, 768),
+                    scale=(0.90, 1.00),
+                    ratio=(1.30, 1.37),  # around 768/576 = 1.333
+                    interpolation=cv2.INTER_LINEAR,
+                    mask_interpolation=cv2.INTER_NEAREST,
+                    p=1.0,
+                ),
+                A.Resize(576, 768, interpolation=cv2.INTER_LINEAR, p=1.0),
+            ], p=0.5),
+
+            A.OneOf([
+                A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=1.0),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.15,
+                    contrast_limit=0.15,
+                    p=1.0,
+                ),
+                A.RandomGamma(gamma_limit=(85, 115), p=1.0),
+            ], p=0.6),
+
+            A.GaussNoise(std_range=(0.01, 0.04), mean_range=(0.0, 0.0), p=0.2),
+
+            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+            A.ToTensorV2(),
+        ])
+
+        self.train_transforms_3 = A.Compose([
+            # Spatial / geometric
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+            A.ElasticTransform(alpha=1, sigma=50, border_mode=cv2.BORDER_CONSTANT, p=0.2),
+
+            # Color / intensity (image-only, masks unaffected)
+            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
+
+            # Normalize + to tensor
+            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+            A.ToTensorV2(),
+        ])
+
+        self.val_transforms = A.Compose([
+            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+            A.ToTensorV2(),
+        ])
+
 
 config: Config = None
 """ Create and assign before training/inference """
@@ -338,7 +433,7 @@ def train(
 
     torch.manual_seed(config.seed)
 
-    best_weights_path = config.training_output_folder + 'best.pt'
+    best_weights_path = env.training_output_folder + 'best.pt'
 
     epochs_since_best = 0
 
