@@ -306,6 +306,8 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
     model.train()
     running_loss = 0.0
 
+    weighted_batch_ious = []
+
     num_batches = _num_batches(loader)
     for batch_number, (x, y) in enumerate(loader):
         print(f't={time.time() - start_time:.2f}: Loading training batch {batch_number + 1}/{num_batches}')
@@ -327,23 +329,28 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
                 logits_0_mask = logits[0].argmax(dim=0)
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
-            loss = loss_function(logits, y)
+            loss, iou = loss_function(logits, y)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         if scheduler is not None:
             scheduler.step()
-        running_loss += loss.item()
+        batch_size = x.size(0)
+        running_loss += loss.item() * batch_size
+        weighted_batch_ious.append((iou * batch_size).item())
 
-    epoch_loss = running_loss / num_batches
-    return epoch_loss
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
+    return epoch_loss, epoch_iou
 
 
 @torch.no_grad()
 def validate_one_epoch(start_time, model, loader, loss_function):
     model.eval()
     running_loss = 0.0
+
+    weighted_batch_ious = []
 
     num_batches = _num_batches(loader)
     for batch_number, (x, y) in enumerate(loader):
@@ -362,12 +369,15 @@ def validate_one_epoch(start_time, model, loader, loss_function):
                 logits_0_mask = logits[0].argmax(dim=0)
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
-            loss = loss_function(logits, y)
+            loss, iou = loss_function(logits, y)
 
-        running_loss += loss.item()
+        batch_size = x.size(0)
+        running_loss += loss.item() * batch_size
+        weighted_batch_ious.append((iou * batch_size).item())
 
-    epoch_loss = running_loss / num_batches
-    return epoch_loss
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
+    return epoch_loss, epoch_iou
 
 
 def train(
