@@ -498,7 +498,7 @@ def train(
                 best_val_iou = val_iou
                 best_val_iou_epoch = epoch
                 epochs_since_best = 0
-                torch.save(model.state_dict(), best_weights_path)
+                torch.save(model.model.state_dict(), best_weights_path)
             else:
                 epochs_since_best += 1
                 if epochs_since_best >= config.patience:
