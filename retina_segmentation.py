@@ -1,3 +1,5 @@
+# !pip install segmentation-models-pytorch torchinfo
+
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -23,6 +25,11 @@ from typing import Callable
 from pathlib import Path
 import random
 
+# from google.colab import drive
+# drive.mount('/content/drive')
+
+# wandb.login()
+
 @dataclass
 class Environment:
     train_images_folder: str
@@ -33,19 +40,19 @@ class Environment:
     training_output_folder: str
     device: str
 
-    def fetch_train_ids(self):
-        ids = np.array([f.stem for f in Path(self.train_images_folder).iterdir()])
+    def fetch_train_filenames(self):
+        names = np.array([f.name for f in Path(self.train_images_folder).iterdir()])
         if config.fraction >= .99:
-            return ids
-        fraction_of_ids = random.choices(ids, k=math.ceil(len(ids) * config.fraction))
-        return fraction_of_ids
+            return names
+        fraction_of_names = random.choices(names, k=math.ceil(len(names) * config.fraction))
+        return fraction_of_names
 
-    def fetch_val_ids(self):
-        return np.array([f.stem for f in Path(self.val_images_folder).iterdir()])
+    def fetch_val_filenames(self):
+        return np.array([f.name for f in Path(self.val_images_folder).iterdir()])
 
 
 env: Environment = None
-""" Set to appropriate environment before training/inference """
+""" Set to appropriate environment before training/inference """;
 
 local_env = Environment(
     train_images_folder='data/train_images/',
@@ -54,11 +61,21 @@ local_env = Environment(
     val_labels_folder='data/test_labels/',
     saved_weights_filepath='data_gen/best.pt',
     training_output_folder='data_gen/',
-    device='cpu'
+    device='cpu',
+)
+colab_home_folder = '/content/drive/My Drive/Colab Notebooks/retina-segmentation/'
+colab_env = Environment(
+    train_images_folder=colab_home_folder + 'data/train_images/',
+    train_labels_folder=colab_home_folder + 'data/train_labels/',
+    val_images_folder=colab_home_folder + 'data/test_images/',
+    val_labels_folder=colab_home_folder + 'data/test_labels/',
+    saved_weights_filepath=colab_home_folder + 'data_gen/best.pt',
+    training_output_folder=colab_home_folder + 'data_gen/',
+    device='cuda',
 )
 
 class Config:
-    def __init__(self, training, verbose=False):
+    def __init__(self, training, verbose=False, debug=False):
         self.verbose = verbose
         self.training = training
         if self.training:
@@ -68,16 +85,16 @@ class Config:
         self.seed = 8675309
         self.batch_size = 32
         self.starting_learning_rate = 1e-4
-        self.max_epochs = 40
-        self.patience = 5
-        self.num_workers = 9 if env.device == 'cuda' else 0
+        self.max_epochs = 400
+        self.patience = 100
+        self.num_workers = 9 if env.device == 'cuda' and not debug else 0
         self.pin_memory = self.num_workers > 0
         self.use_amp = env.device == 'cuda'
         self.original_image_width = 768
         self.original_image_height = 576
         self.image_width = 768
         self.image_height = 576
-        self.fraction = 0.1
+        self.fraction = 0.1 if debug else 1
 
         self.imagenet_mean_cpu_tensor = torch.tensor(imagenet_mean_array)
         self.imagenet_std_cpu_tensor = torch.tensor(imagenet_std_array)
@@ -95,6 +112,7 @@ class Config:
         self.generator = torch.Generator(device='cpu').manual_seed(self.seed)
 
         self.train_transforms = A.Compose([
+            A.Resize(self.image_height, self.image_width),
             A.HorizontalFlip(p=0.5),
             A.ShiftScaleRotate(
                 shift_limit=0.03,
@@ -113,77 +131,79 @@ class Config:
             A.ToTensorV2(),
         ])
 
-        self.train_transforms_2 = A.Compose([
-            A.HorizontalFlip(p=0.5),
-
-            A.Affine(
-                scale=(0.95, 1.05),
-                translate_percent=(-0.03, 0.03),
-                rotate=(-10, 10),
-                shear=(-5, 5),
-                interpolation=cv2.INTER_LINEAR,
-                mask_interpolation=cv2.INTER_NEAREST,
-                border_mode=cv2.BORDER_CONSTANT,
-                p=0.7,
-            ),
-
-            # Mild crop/resize jitter around full resolution
-            A.OneOf([
-                A.RandomResizedCrop(
-                    size=(576, 768),
-                    scale=(0.90, 1.00),
-                    ratio=(1.30, 1.37),  # around 768/576 = 1.333
-                    interpolation=cv2.INTER_LINEAR,
-                    mask_interpolation=cv2.INTER_NEAREST,
-                    p=1.0,
-                ),
-                A.Resize(576, 768, interpolation=cv2.INTER_LINEAR, p=1.0),
-            ], p=0.5),
-
-            A.OneOf([
-                A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=1.0),
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.15,
-                    contrast_limit=0.15,
-                    p=1.0,
-                ),
-                A.RandomGamma(gamma_limit=(85, 115), p=1.0),
-            ], p=0.6),
-
-            A.GaussNoise(std_range=(0.01, 0.04), mean_range=(0.0, 0.0), p=0.2),
-
-            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
-            A.ToTensorV2(),
-        ])
-
-        self.train_transforms_3 = A.Compose([
-            # Spatial / geometric
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=0.5),
-            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, border_mode=cv2.BORDER_CONSTANT, p=0.5),
-            A.ElasticTransform(alpha=1, sigma=50, border_mode=cv2.BORDER_CONSTANT, p=0.2),
-
-            # Color / intensity (image-only, masks unaffected)
-            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
-            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-            A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
-
-            # Normalize + to tensor
-            A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
-            A.ToTensorV2(),
-        ])
+        # self.train_transforms_2 = A.Compose([
+        #     A.HorizontalFlip(p=0.5),
+        #
+        #     A.Affine(
+        #         scale=(0.95, 1.05),
+        #         translate_percent=(-0.03, 0.03),
+        #         rotate=(-10, 10),
+        #         shear=(-5, 5),
+        #         interpolation=cv2.INTER_LINEAR,
+        #         mask_interpolation=cv2.INTER_NEAREST,
+        #         border_mode=cv2.BORDER_CONSTANT,
+        #         p=0.7,
+        #     ),
+        #
+        #     # Mild crop/resize jitter around full resolution
+        #     A.OneOf([
+        #         A.RandomResizedCrop(
+        #             size=(self.image_height, self.image_width),
+        #             scale=(0.90, 1.00),
+        #             ratio=(1.30, 1.37),  # around 768/576 = 1.333
+        #             interpolation=cv2.INTER_LINEAR,
+        #             mask_interpolation=cv2.INTER_NEAREST,
+        #             p=1.0,
+        #         ),
+        #         A.Resize(self.image_height, self.image_width, interpolation=cv2.INTER_LINEAR, p=1.0),
+        #     ], p=0.5),
+        #
+        #     A.OneOf([
+        #         A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=1.0),
+        #         A.RandomBrightnessContrast(
+        #             brightness_limit=0.15,
+        #             contrast_limit=0.15,
+        #             p=1.0,
+        #         ),
+        #         A.RandomGamma(gamma_limit=(85, 115), p=1.0),
+        #     ], p=0.6),
+        #
+        #     A.GaussNoise(std_range=(0.01, 0.04), mean_range=(0.0, 0.0), p=0.2),
+        #
+        #     A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+        #     A.ToTensorV2(),
+        # ])
+        #
+        # self.train_transforms_3 = A.Compose([
+        #     A.Resize(self.image_height, self.image_width),
+        #     # Spatial / geometric
+        #     A.HorizontalFlip(p=0.5),
+        #     A.VerticalFlip(p=0.5),
+        #     A.RandomRotate90(p=0.5),
+        #     A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+        #     A.ElasticTransform(alpha=1, sigma=50, border_mode=cv2.BORDER_CONSTANT, p=0.2),
+        #
+        #     # Color / intensity (image-only, masks unaffected)
+        #     A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
+        #     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        #     A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+        #     A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        #     A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
+        #
+        #     # Normalize + to tensor
+        #     A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
+        #     A.ToTensorV2(),
+        # ])
 
         self.val_transforms = A.Compose([
+            A.Resize(self.image_height, self.image_width),
             A.Normalize(mean=imagenet_mean_tuple, std=imagenet_std_tuple),
             A.ToTensorV2(),
         ])
 
 
 config: Config = None
-""" Create and assign before training/inference """
+""" Create and assign before training/inference """;
 
 imagenet_mean_tuple = (0.485, 0.456, 0.406)
 imagenet_std_tuple = (0.229, 0.224, 0.225)
@@ -206,7 +226,7 @@ def gpu_image_tensor_to_numpy_array(image_tensor):
 
 def gpu_mask_tensor_to_colored_mask_numpy_array(mask_tensor):
     mask = mask_tensor.cpu().numpy()
-    mask = np.clip(mask, 0, config.num_classes - 1).astype(np.int32)
+    mask = np.clip(mask, 0, len(CLASS_COLORS) - 1).astype(np.int32)
     return CLASS_COLORS[mask]
 
 def visualize_image(image_tensor):
@@ -255,25 +275,24 @@ def _num_batches(dataloader):
 class SegmentationDataset(TorchDataset):
     images_root_folder: str
     masks_root_folder: str
-    image_suffix: str
-    mask_suffix: str
     image_transforms: A.Compose
-    image_ids: np.ndarray
+    image_filenames: np.ndarray
     has_masks: bool
 
     def __len__(self):
-        return len(self.image_ids)
+        return len(self.image_filenames)
 
     def __getitem__(self, idx):
-        image_id = self.image_ids[idx]
-        image = cv2.cvtColor(cv2.imread(f'{self.images_root_folder}{image_id}.{self.image_suffix}'), cv2.COLOR_BGR2RGB)
+        image_filename = self.image_filenames[idx]
+        image = cv2.cvtColor(cv2.imread(f'{self.images_root_folder}{image_filename}'), cv2.COLOR_BGR2RGB)
         if self.has_masks:
-            mask = cv2.imread(f'{self.masks_root_folder}{image_id}.{self.mask_suffix}', cv2.IMREAD_GRAYSCALE)
+            mask_stem = Path(image_filename).stem
+            mask_path = next(Path(self.masks_root_folder).glob(f'{mask_stem}.*'))
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             transformed = self.image_transforms(image=image, mask=mask)
             return transformed['image'], transformed['mask']
         transformed = self.image_transforms(image=image)
         return transformed['image']
-
 
 class RetinaSegModel(nn.Module):
     def __init__(self, saved_model_weights=None):
@@ -294,7 +313,6 @@ class RetinaSegModel(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-
 class RetinaSegLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -314,7 +332,6 @@ class RetinaSegLoss(nn.Module):
 
         return loss, iou
 
-
 def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler, scheduler):
     model.train()
     running_loss = 0.0
@@ -333,7 +350,7 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
             reserved = torch.cuda.memory_reserved(env.device) / 1024**3
             print(f'Memory allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB')
             print(f'First image with overlayed ground-truth mask:')
-            visualize_mask_overlayed_over_image(x[0], y[0])
+            visualize_mask_overlayed_over_image(x[0], (y[0] > 0).long())
 
         optimizer.zero_grad()
         with torch.amp.autocast('cuda', enabled=config.use_amp):
@@ -357,7 +374,6 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
     epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
     return epoch_loss, epoch_iou
 
-
 @torch.no_grad()
 def validate_one_epoch(start_time, model, loader, loss_function):
     model.eval()
@@ -374,7 +390,7 @@ def validate_one_epoch(start_time, model, loader, loss_function):
 
         if config.verbose or batch_number == 0:
             print(f'First image with overlayed ground-truth mask:')
-            visualize_mask_overlayed_over_image(x[0], y[0])
+            visualize_mask_overlayed_over_image(x[0], (y[0] > 0).long())
 
         with torch.amp.autocast('cuda', enabled=config.use_amp):
             logits = model(x)
@@ -391,7 +407,6 @@ def validate_one_epoch(start_time, model, loader, loss_function):
     epoch_loss = running_loss / len(loader.dataset)
     epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
     return epoch_loss, epoch_iou
-
 
 def train(
         start_epoch = 1,
@@ -414,8 +429,8 @@ def train(
         },
     )
 
-    train_ids = env.fetch_train_ids()
-    val_ids = env.fetch_val_ids()
+    train_filenames = env.fetch_train_filenames()
+    val_filenames = env.fetch_val_filenames()
 
     model = RetinaSegModel(saved_model_weights=saved_model_weights)
 
@@ -424,19 +439,15 @@ def train(
     train_dataset = SegmentationDataset(
         images_root_folder=env.train_images_folder,
         masks_root_folder=env.train_labels_folder,
-        image_suffix='tif',
-        mask_suffix='tif',
         image_transforms=config.train_transforms,
-        image_ids=train_ids,
+        image_filenames=train_filenames,
         has_masks=True,
     )
     val_dataset = SegmentationDataset(
         images_root_folder=env.val_images_folder,
         masks_root_folder=env.val_labels_folder,
-        image_suffix='tif',
-        mask_suffix='tif',
         image_transforms=config.val_transforms,
-        image_ids=val_ids,
+        image_filenames=val_filenames,
         has_masks=True,
     )
 
@@ -552,6 +563,55 @@ def train(
 
         wandb.finish()
 
+def validate_dataset_dimensions(images_folder, masks_folder):
+    filenames = [f.name for f in Path(images_folder).iterdir()]
+    mismatches = []
+    for filename in filenames:
+        image = cv2.imread(f'{images_folder}{filename}')
+        if image is None:
+            print(f'WARNING: Could not read image: {filename}')
+            continue
+        mask_stem = Path(filename).stem
+        mask_path = next(Path(masks_folder).glob(f'{mask_stem}.*'), None)
+        if mask_path is None:
+            print(f'WARNING: No mask found for: {filename}')
+            continue
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            print(f'WARNING: Could not read mask: {mask_path}')
+            continue
+        if image.shape[:2] != mask.shape[:2]:
+            mismatches.append((filename, image.shape[:2], mask_path.name, mask.shape[:2]))
+    if mismatches:
+        print(f'Found {len(mismatches)} image/mask dimension mismatches:')
+        for img_name, img_shape, mask_name, mask_shape in mismatches:
+            print(f'  {img_name} {img_shape} vs {mask_name} {mask_shape}')
+    else:
+        print(f'All {len(filenames)} image/mask dimensions match.')
+    return mismatches
+
+def print_image_dimensions_info(images_folder):
+    from collections import Counter
+    dims = Counter()
+    for f in Path(images_folder).iterdir():
+        img = cv2.imread(str(f))
+        if img is None:
+            print(f'WARNING: Could not read: {f.name}')
+            continue
+        h, w = img.shape[:2]
+        dims[(w, h)] += 1
+    for (w, h), count in dims.most_common():
+        print(f'  {w}x{h}: {count}')
+
+def fix_image_364_mask(labels_folder):
+    mask_path = next(Path(labels_folder).glob('image_364.*'))
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask.shape[1] == 1443:
+        mask = np.pad(mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+        cv2.imwrite(str(mask_path), mask)
+        print(f'Fixed {mask_path.name}: padded width from 1443 to {mask.shape[1]}')
+    else:
+        print(f'{mask_path.name} already has correct dimensions: {mask.shape}')
 
 def main():
     global env, config
