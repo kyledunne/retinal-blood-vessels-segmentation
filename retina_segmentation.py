@@ -603,15 +603,16 @@ def print_image_dimensions_info(images_folder):
     for (w, h), count in dims.most_common():
         print(f'  {w}x{h}: {count}')
 
-def fix_image_364_mask(labels_folder):
-    mask_path = next(Path(labels_folder).glob('image_364.*'))
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if mask.shape[1] == 1443:
-        mask = np.pad(mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
-        cv2.imwrite(str(mask_path), mask)
-        print(f'Fixed {mask_path.name}: padded width from 1443 to {mask.shape[1]}')
-    else:
-        print(f'{mask_path.name} already has correct dimensions: {mask.shape}')
+# Mask has been fixed
+# def fix_image_364_mask(labels_folder):
+#     mask_path = next(Path(labels_folder).glob('image_364.*'))
+#     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+#     if mask.shape[1] == 1443:
+#         mask = np.pad(mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+#         cv2.imwrite(str(mask_path), mask)
+#         print(f'Fixed {mask_path.name}: padded width from 1443 to {mask.shape[1]}')
+#     else:
+#         print(f'{mask_path.name} already has correct dimensions: {mask.shape}')
 
 def main():
     global env, config
