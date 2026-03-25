@@ -616,8 +616,8 @@ def fix_image_364_mask(labels_folder):
 def main():
     global env, config
     env = local_env
-    config = Config(training=True)
-    train()
+    config = Config(training=False)
+    print_image_dimensions_info(env.val_images_folder)
 
 if __name__ == '__main__':
     main()
