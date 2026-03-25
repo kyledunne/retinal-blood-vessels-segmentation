@@ -343,22 +343,60 @@ class RetinaSegLoss(nn.Module):
     def forward(self, logits, targets):
         targets = targets.unsqueeze(1).float()
         targets = (targets > 0.5).float()
-        loss = self.loss(logits, targets)
+        return self.loss(logits, targets)
 
-        with torch.no_grad():
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
-            intersection = (preds * targets).sum()
-            union = preds.sum() + targets.sum() - intersection
-            iou = intersection / (union + 1e-6)
 
-        return loss, iou
+class MetricsAccumulator:
+    def __init__(self):
+        self.reset()
 
-def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler, scheduler):
+    def reset(self):
+        self.total_correct = 0
+        self.total_pixels = 0
+        self.vessel_intersection = 0
+        self.vessel_union = 0
+        self.bg_intersection = 0
+        self.bg_union = 0
+
+    @torch.no_grad()
+    def update(self, logits, targets):
+        targets = targets.unsqueeze(1).float()
+        targets = (targets > 0.5).float()
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+
+        self.total_correct += (preds == targets).sum().item()
+        self.total_pixels += targets.numel()
+
+        v_inter = (preds * targets).sum().item()
+        v_union = preds.sum().item() + targets.sum().item() - v_inter
+        self.vessel_intersection += v_inter
+        self.vessel_union += v_union
+
+        preds_bg = 1.0 - preds
+        targets_bg = 1.0 - targets
+        bg_inter = (preds_bg * targets_bg).sum().item()
+        bg_union = preds_bg.sum().item() + targets_bg.sum().item() - bg_inter
+        self.bg_intersection += bg_inter
+        self.bg_union += bg_union
+
+    def compute(self):
+        accuracy = self.total_correct / (self.total_pixels + 1e-6)
+        vessel_iou = self.vessel_intersection / (self.vessel_union + 1e-6)
+        bg_iou = self.bg_intersection / (self.bg_union + 1e-6)
+        mean_iou = (vessel_iou + bg_iou) / 2.0
+        return {
+            'accuracy': accuracy,
+            'vessel_iou': vessel_iou,
+            'bg_iou': bg_iou,
+            'mean_iou': mean_iou,
+        }
+
+
+def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler, scheduler, metrics):
     model.train()
+    metrics.reset()
     running_loss = 0.0
-
-    weighted_batch_ious = []
 
     num_batches = _num_batches(loader)
     for batch_number, (x, y) in enumerate(loader):
@@ -381,7 +419,7 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
                 logits_0_mask = (logits[0, 0] > 0).long()
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
-            loss, iou = loss_function(logits, y)
+            loss = loss_function(logits, y)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -390,18 +428,17 @@ def train_one_epoch(start_time, model, loader, optimizer, loss_function, scaler,
             scheduler.step()
         batch_size = x.size(0)
         running_loss += loss.item() * batch_size
-        weighted_batch_ious.append((iou * batch_size).item())
+        metrics.update(logits.detach(), y)
 
     epoch_loss = running_loss / len(loader.dataset)
-    epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
-    return epoch_loss, epoch_iou
+    return epoch_loss, metrics.compute()
 
 @torch.no_grad()
-def validate_one_epoch(start_time, model, loader, loss_function):
+def validate_one_epoch(start_time, model, loader, loss_function, metrics):
     model.eval()
+    metrics.reset()
     running_loss = 0.0
-
-    weighted_batch_ious = []
+    pred_masks = []
 
     num_batches = _num_batches(loader)
     for batch_number, (x, y) in enumerate(loader):
@@ -420,15 +457,151 @@ def validate_one_epoch(start_time, model, loader, loss_function):
                 logits_0_mask = (logits[0, 0] > 0).long()
                 print(f'First image with overlayed prediction mask:')
                 visualize_mask_overlayed_over_image(x[0], logits_0_mask)
-            loss, iou = loss_function(logits, y)
+            loss = loss_function(logits, y)
 
         batch_size = x.size(0)
         running_loss += loss.item() * batch_size
-        weighted_batch_ious.append((iou * batch_size).item())
+        metrics.update(logits, y)
+        batch_masks = (logits[:, 0] > 0).long().cpu()
+        pred_masks.extend(batch_masks)
 
     epoch_loss = running_loss / len(loader.dataset)
-    epoch_iou = sum(weighted_batch_ious) / len(loader.dataset)
-    return epoch_loss, epoch_iou
+    return epoch_loss, metrics.compute(), pred_masks
+
+
+def fullsize_validate(pred_masks, fullsize_gt_dataset):
+    global_correct = 0
+    global_pixels = 0
+    global_vessel_inter = 0
+    global_vessel_union = 0
+    global_bg_inter = 0
+    global_bg_union = 0
+
+    per_image_accuracies = []
+    per_image_vessel_ious = []
+    per_image_bg_ious = []
+    per_image_mean_ious = []
+
+    for i in range(len(fullsize_gt_dataset)):
+        _, gt_mask = fullsize_gt_dataset[i]
+        gt_mask = gt_mask.numpy() if isinstance(gt_mask, torch.Tensor) else gt_mask
+
+        pred_mask = pred_masks[i].cpu().numpy() if isinstance(pred_masks[i], torch.Tensor) else np.array(pred_masks[i])
+
+        if pred_mask.shape != gt_mask.shape:
+            pred_mask = cv2.resize(pred_mask.astype(np.uint8), (gt_mask.shape[1], gt_mask.shape[0]),
+                                   interpolation=cv2.INTER_NEAREST)
+
+        gt_binary = (gt_mask > 0).astype(np.uint8)
+        pred_binary = (pred_mask > 0).astype(np.uint8)
+
+        # Accuracy
+        correct = (pred_binary == gt_binary).sum()
+        pixels = gt_binary.size
+        global_correct += correct
+        global_pixels += pixels
+        per_image_accuracies.append(correct / (pixels + 1e-6))
+
+        # Vessel IoU (class=1)
+        gt_v = (gt_binary == 1)
+        pred_v = (pred_binary == 1)
+        v_inter = np.logical_and(gt_v, pred_v).sum()
+        v_union = np.logical_or(gt_v, pred_v).sum()
+        global_vessel_inter += v_inter
+        global_vessel_union += v_union
+        img_vessel_iou = v_inter / (v_union + 1e-6)
+        per_image_vessel_ious.append(img_vessel_iou)
+
+        # Background IoU (class=0)
+        gt_bg = (gt_binary == 0)
+        pred_bg = (pred_binary == 0)
+        bg_inter = np.logical_and(gt_bg, pred_bg).sum()
+        bg_union = np.logical_or(gt_bg, pred_bg).sum()
+        global_bg_inter += bg_inter
+        global_bg_union += bg_union
+        img_bg_iou = bg_inter / (bg_union + 1e-6)
+        per_image_bg_ious.append(img_bg_iou)
+
+        per_image_mean_ious.append((img_vessel_iou + img_bg_iou) / 2.0)
+
+    global_accuracy = global_correct / (global_pixels + 1e-6)
+    global_vessel_iou = global_vessel_inter / (global_vessel_union + 1e-6)
+    global_bg_iou = global_bg_inter / (global_bg_union + 1e-6)
+    global_mean_iou = (global_vessel_iou + global_bg_iou) / 2.0
+
+    return {
+        'global_accuracy': global_accuracy,
+        'per_image_accuracy': float(np.mean(per_image_accuracies)),
+        'global_vessel_iou': global_vessel_iou,
+        'global_bg_iou': global_bg_iou,
+        'global_mean_iou': global_mean_iou,
+        'per_image_vessel_iou': float(np.mean(per_image_vessel_ious)),
+        'per_image_bg_iou': float(np.mean(per_image_bg_ious)),
+        'per_image_mean_iou': float(np.mean(per_image_mean_ious)),
+    }
+
+def _plot_training_metrics(history):
+    num_epochs = len(history['train_loss'])
+    epochs = list(range(1, num_epochs + 1))
+
+    def _make_plot(title, series, ylabel, wandb_key):
+        plt.figure(figsize=(10, 6))
+        for label, key in series:
+            plt.plot(epochs, history[key], label=label, marker='o', markersize=3)
+        plt.xlabel('Epoch')
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        wandb.log({wandb_key: wandb.Image(plt.gcf())})
+        plt.show()
+        plt.close()
+
+    _make_plot('Training and Validation Loss', [
+        ('Train Loss', 'train_loss'),
+        ('Val Loss', 'val_loss'),
+    ], 'Loss', 'loss_plot')
+
+    _make_plot('Accuracy', [
+        ('Train', 'train_accuracy'),
+        ('Val (fixed-size)', 'val_accuracy'),
+        ('Fullsize Global', 'fullsize_global_accuracy'),
+        ('Fullsize Per-Image', 'fullsize_per_image_accuracy'),
+    ], 'Accuracy', 'accuracy_plot')
+
+    _make_plot('Vessel IoU', [
+        ('Train', 'train_vessel_iou'),
+        ('Val (fixed-size)', 'val_vessel_iou'),
+        ('Fullsize Global', 'fullsize_global_vessel_iou'),
+        ('Fullsize Per-Image', 'fullsize_per_image_vessel_iou'),
+    ], 'IoU', 'vessel_iou_plot')
+
+    _make_plot('Background IoU', [
+        ('Train', 'train_bg_iou'),
+        ('Val (fixed-size)', 'val_bg_iou'),
+        ('Fullsize Global', 'fullsize_global_bg_iou'),
+        ('Fullsize Per-Image', 'fullsize_per_image_bg_iou'),
+    ], 'IoU', 'bg_iou_plot')
+
+    _make_plot('Mean IoU', [
+        ('Train', 'train_mean_iou'),
+        ('Val (fixed-size)', 'val_mean_iou'),
+        ('Fullsize Global', 'fullsize_global_mean_iou'),
+        ('Fullsize Per-Image', 'fullsize_per_image_mean_iou'),
+    ], 'IoU', 'mean_iou_plot')
+
+    _make_plot('Full-Size Validation Metrics', [
+        ('Global Accuracy', 'fullsize_global_accuracy'),
+        ('Per-Image Accuracy', 'fullsize_per_image_accuracy'),
+        ('Global Vessel IoU', 'fullsize_global_vessel_iou'),
+        ('Global BG IoU', 'fullsize_global_bg_iou'),
+        ('Global Mean IoU', 'fullsize_global_mean_iou'),
+        ('Per-Image Vessel IoU', 'fullsize_per_image_vessel_iou'),
+        ('Per-Image BG IoU', 'fullsize_per_image_bg_iou'),
+        ('Per-Image Mean IoU', 'fullsize_per_image_mean_iou'),
+    ], 'Value', 'fullsize_all_metrics_plot')
+
 
 def train(
         start_epoch = 1,
@@ -472,6 +645,13 @@ def train(
         image_filenames=val_filenames,
         has_masks=True,
     )
+    fullsize_gt_dataset = SegmentationDataset(
+        images_root_folder=env.val_images_folder,
+        masks_root_folder=env.val_labels_folder,
+        image_transforms=config.test_transforms,
+        image_filenames=val_filenames,
+        has_masks=True,
+    )
 
     train_loader = create_dataloader(train_dataset, shuffle=True)
     val_loader = create_dataloader(val_dataset, shuffle=False)
@@ -481,13 +661,20 @@ def train(
     scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp)
     scheduler = None
 
-    best_val_iou = float('-inf')
-    best_val_iou_epoch = -1
+    train_metrics = MetricsAccumulator()
+    val_metrics = MetricsAccumulator()
 
-    history = dict(
-        train_loss=[], val_loss=[], train_iou=[], val_iou=[],
-        best_val_iou=dict(),
-    )
+    best_fullsize_global_mean_iou = float('-inf')
+    best_epoch = -1
+
+    history = {
+        'train_loss': [], 'train_accuracy': [], 'train_vessel_iou': [], 'train_bg_iou': [], 'train_mean_iou': [],
+        'val_loss': [], 'val_accuracy': [], 'val_vessel_iou': [], 'val_bg_iou': [], 'val_mean_iou': [],
+        'fullsize_global_accuracy': [], 'fullsize_per_image_accuracy': [],
+        'fullsize_global_vessel_iou': [], 'fullsize_global_bg_iou': [], 'fullsize_global_mean_iou': [],
+        'fullsize_per_image_vessel_iou': [], 'fullsize_per_image_bg_iou': [], 'fullsize_per_image_mean_iou': [],
+        'best': {},
+    }
 
     training_start_time = time.time()
     print(f't={training_start_time - start_time:.2f}: Started training')
@@ -502,33 +689,63 @@ def train(
             epoch_start_time = time.time()
             print(f't={epoch_start_time - start_time:.2f}: Starting epoch {epoch}/{config.max_epochs}. Early stopping in {config.patience - epochs_since_best} epochs.')
 
-            train_loss, train_iou = train_one_epoch(epoch_start_time, model, train_loader, optimizer, loss_function, scaler, scheduler)
+            train_loss, train_m = train_one_epoch(epoch_start_time, model, train_loader, optimizer, loss_function, scaler, scheduler, train_metrics)
 
             if env.device == 'cuda':
                 torch.cuda.empty_cache()
 
-            val_loss, val_iou = validate_one_epoch(epoch_start_time, model, val_loader, loss_function)
+            val_loss, val_m, pred_masks = validate_one_epoch(epoch_start_time, model, val_loader, loss_function, val_metrics)
+
+            fullsize_m = fullsize_validate(pred_masks, fullsize_gt_dataset)
 
             history['train_loss'].append(train_loss)
+            history['train_accuracy'].append(train_m['accuracy'])
+            history['train_vessel_iou'].append(train_m['vessel_iou'])
+            history['train_bg_iou'].append(train_m['bg_iou'])
+            history['train_mean_iou'].append(train_m['mean_iou'])
+
             history['val_loss'].append(val_loss)
-            history['train_iou'].append(train_iou)
-            history['val_iou'].append(val_iou)
+            history['val_accuracy'].append(val_m['accuracy'])
+            history['val_vessel_iou'].append(val_m['vessel_iou'])
+            history['val_bg_iou'].append(val_m['bg_iou'])
+            history['val_mean_iou'].append(val_m['mean_iou'])
+
+            for key in fullsize_m:
+                history[f'fullsize_{key}'].append(fullsize_m[key])
 
             print(f'================ Epoch {epoch:03d} stats ==================')
             print(f'train_loss: {train_loss:.4f}  val_loss: {val_loss:.4f}')
-            print(f'train_iou: {train_iou:.4f}  val_iou: {val_iou:.4f}')
+            print(f'train_acc: {train_m["accuracy"]:.4f}  val_acc: {val_m["accuracy"]:.4f}')
+            print(f'train_vessel_iou: {train_m["vessel_iou"]:.4f}  val_vessel_iou: {val_m["vessel_iou"]:.4f}')
+            print(f'train_bg_iou: {train_m["bg_iou"]:.4f}  val_bg_iou: {val_m["bg_iou"]:.4f}')
+            print(f'train_mean_iou: {train_m["mean_iou"]:.4f}  val_mean_iou: {val_m["mean_iou"]:.4f}')
+            print(f'fullsize_global_mean_iou: {fullsize_m["global_mean_iou"]:.4f}  fullsize_per_image_mean_iou: {fullsize_m["per_image_mean_iou"]:.4f}')
             print('===================================================')
 
             wandb.log({
                 'train_loss': train_loss,
+                'train_accuracy': train_m['accuracy'],
+                'train_vessel_iou': train_m['vessel_iou'],
+                'train_bg_iou': train_m['bg_iou'],
+                'train_mean_iou': train_m['mean_iou'],
                 'val_loss': val_loss,
-                'train_iou': train_iou,
-                'val_iou': val_iou,
+                'val_accuracy': val_m['accuracy'],
+                'val_vessel_iou': val_m['vessel_iou'],
+                'val_bg_iou': val_m['bg_iou'],
+                'val_mean_iou': val_m['mean_iou'],
+                'fullsize_global_accuracy': fullsize_m['global_accuracy'],
+                'fullsize_per_image_accuracy': fullsize_m['per_image_accuracy'],
+                'fullsize_global_vessel_iou': fullsize_m['global_vessel_iou'],
+                'fullsize_global_bg_iou': fullsize_m['global_bg_iou'],
+                'fullsize_global_mean_iou': fullsize_m['global_mean_iou'],
+                'fullsize_per_image_vessel_iou': fullsize_m['per_image_vessel_iou'],
+                'fullsize_per_image_bg_iou': fullsize_m['per_image_bg_iou'],
+                'fullsize_per_image_mean_iou': fullsize_m['per_image_mean_iou'],
             })
 
-            if val_iou > best_val_iou:
-                best_val_iou = val_iou
-                best_val_iou_epoch = epoch
+            if fullsize_m['global_mean_iou'] > best_fullsize_global_mean_iou:
+                best_fullsize_global_mean_iou = fullsize_m['global_mean_iou']
+                best_epoch = epoch
                 epochs_since_best = 0
                 torch.save(model.model.state_dict(), env.saved_weights_filepath)
             else:
@@ -542,38 +759,20 @@ def train(
         wandb.run.summary['training_manually_interrupted'] = True
 
     finally:
-        history['best_val_iou']['val_iou'] = best_val_iou
-        history['best_val_iou']['epoch'] = best_val_iou_epoch
+        history['best']['fullsize_global_mean_iou'] = best_fullsize_global_mean_iou
+        history['best']['epoch'] = best_epoch
 
         print()
         print('==================== Results ======================')
-        print(f'Best val iou: {best_val_iou:.2f}')
-        print(f'Best val iou epoch: {best_val_iou_epoch}')
+        print(f'Best fullsize global mean IoU: {best_fullsize_global_mean_iou:.4f}')
+        print(f'Best epoch: {best_epoch}')
         print('===================================================')
         print()
 
-        wandb.run.summary['best_val_iou'] = best_val_iou
-        wandb.run.summary['best_val_iou_epoch'] = best_val_iou_epoch
+        wandb.run.summary['best_fullsize_global_mean_iou'] = best_fullsize_global_mean_iou
+        wandb.run.summary['best_epoch'] = best_epoch
 
-        train_ious = history['train_iou']
-        val_ious = history['val_iou']
-
-        epochs = list(range(1, len(train_ious) + 1))
-
-        plt.figure(figsize=(8, 5))
-        plt.plot(epochs, train_ious, label='Train mean IoU', marker='o')
-        plt.plot(epochs, val_ious, label='Val mean IoU', marker='o')
-        plt.xlabel('Epoch')
-        plt.ylabel('IoU')
-        plt.title('Training and Validation mean IoU per Epoch')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-
-        wandb.log({'iou_plot': wandb.Image(plt.gcf())})
-
-        plt.show()
-        plt.close()
+        _plot_training_metrics(history)
 
         with open(env.training_output_folder + 'history.json', 'w') as json_file:
             json.dump(history, json_file, indent=4)
