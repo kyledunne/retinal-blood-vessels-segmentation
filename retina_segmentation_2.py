@@ -145,7 +145,7 @@ class Config:
 
 config: Config = None
 """ Create and assign before training/inference """;
-#%%
+
 imagenet_mean_tuple = (0.485, 0.456, 0.406)
 imagenet_std_tuple = (0.229, 0.224, 0.225)
 imagenet_mean_array = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -334,7 +334,7 @@ class RetinaSegModel(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-#%%
+
 class RetinaSegLoss(nn.Module):
     def __init__(self):
         super().__init__()
