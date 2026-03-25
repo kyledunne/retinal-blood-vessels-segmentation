@@ -541,7 +541,7 @@ def fullsize_validate(pred_masks, fullsize_gt_dataset):
         'per_image_mean_iou': float(np.mean(per_image_mean_ious)),
     }
 
-def _plot_training_metrics(history):
+def plot_training_metrics(history):
     num_epochs = len(history['train_loss'])
     epochs = list(range(1, num_epochs + 1))
 
@@ -773,7 +773,7 @@ def train(
         wandb.run.summary['best_fullsize_global_mean_iou'] = best_fullsize_global_mean_iou
         wandb.run.summary['best_epoch'] = best_epoch
 
-        _plot_training_metrics(history)
+        plot_training_metrics(history)
 
         with open(env.training_output_folder + 'history.json', 'w') as json_file:
             json.dump(history, json_file, indent=4)
