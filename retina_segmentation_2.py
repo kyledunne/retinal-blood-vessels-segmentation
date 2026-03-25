@@ -350,6 +350,7 @@ class MetricsAccumulator:
     def __init__(self):
         self.reset()
 
+    # noinspection PyAttributeOutsideInit
     def reset(self):
         self.total_correct = 0
         self.total_pixels = 0
